@@ -1,0 +1,140 @@
+{
+	"archive" : {},
+	"artifacts" : 
+	[
+		{
+			"path" : "third-party/gtest-1.7.0/fused-src/gtest/libgtest.a"
+		}
+	],
+	"backtrace" : 1,
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"add_library",
+			"include_directories"
+		],
+		"files" : 
+		[
+			"third-party/gtest-1.7.0/fused-src/gtest/CMakeLists.txt",
+			"CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 1,
+				"parent" : 0
+			},
+			{
+				"file" : 1
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 315,
+				"parent" : 2
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 316,
+				"parent" : 2
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 317,
+				"parent" : 2
+			}
+		]
+	},
+	"compileGroups" : 
+	[
+		{
+			"compileCommandFragments" : 
+			[
+				{
+					"fragment" : " -march=native -W -Wextra -Wall -Wsign-compare -Wshadow -Wno-unused-parameter -Wno-unused-variable -Woverloaded-virtual -Wnon-virtual-dtor -Wno-missing-field-initializers -std=c++11 -Werror -fno-builtin-memcmp -g"
+				}
+			],
+			"defines" : 
+			[
+				{
+					"define" : "HAVE_SSE42"
+				},
+				{
+					"define" : "OS_LINUX"
+				},
+				{
+					"define" : "ROCKSDB_FALLOCATE_PRESENT"
+				},
+				{
+					"define" : "ROCKSDB_LIB_IO_POSIX"
+				},
+				{
+					"define" : "ROCKSDB_MALLOC_USABLE_SIZE"
+				},
+				{
+					"define" : "ROCKSDB_PLATFORM_POSIX"
+				},
+				{
+					"define" : "ROCKSDB_SUPPORT_THREAD_LOCAL"
+				}
+			],
+			"includes" : 
+			[
+				{
+					"backtrace" : 3,
+					"path" : "/home/supermt/CLionProjects/DOTA_SILK_compare"
+				},
+				{
+					"backtrace" : 4,
+					"path" : "/home/supermt/CLionProjects/DOTA_SILK_compare/include"
+				},
+				{
+					"backtrace" : 5,
+					"isSystem" : true,
+					"path" : "/home/supermt/CLionProjects/DOTA_SILK_compare/third-party/gtest-1.7.0/fused-src"
+				}
+			],
+			"language" : "CXX",
+			"sourceIndexes" : 
+			[
+				0
+			]
+		}
+	],
+	"id" : "gtest::@b9c1a3297e1e89dc165e",
+	"name" : "gtest",
+	"nameOnDisk" : "libgtest.a",
+	"paths" : 
+	{
+		"build" : "third-party/gtest-1.7.0/fused-src/gtest",
+		"source" : "third-party/gtest-1.7.0/fused-src/gtest"
+	},
+	"sourceGroups" : 
+	[
+		{
+			"name" : "Source Files",
+			"sourceIndexes" : 
+			[
+				0
+			]
+		}
+	],
+	"sources" : 
+	[
+		{
+			"backtrace" : 1,
+			"compileGroupIndex" : 0,
+			"path" : "third-party/gtest-1.7.0/fused-src/gtest/gtest-all.cc",
+			"sourceGroupIndex" : 0
+		}
+	],
+	"type" : "STATIC_LIBRARY"
+}

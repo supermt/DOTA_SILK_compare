@@ -1,0 +1,97 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"install"
+		],
+		"files" : 
+		[
+			"CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 825,
+				"parent" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 826,
+				"parent" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 827,
+				"parent" : 0
+			}
+		]
+	},
+	"installers" : 
+	[
+		{
+			"backtrace" : 1,
+			"component" : "devel",
+			"destination" : "lib64",
+			"paths" : 
+			[
+				"librocksdb.a"
+			],
+			"targetId" : "rocksdb::@6890427a1f51a3e7e1df",
+			"targetIndex" : 122,
+			"type" : "target"
+		},
+		{
+			"backtrace" : 2,
+			"component" : "runtime",
+			"destination" : "lib64",
+			"paths" : 
+			[
+				"librocksdb.so.5.7.0",
+				"librocksdb.so.5"
+			],
+			"targetId" : "rocksdb-shared::@6890427a1f51a3e7e1df",
+			"targetIndex" : 123,
+			"targetInstallNamelink" : "skip",
+			"type" : "target"
+		},
+		{
+			"backtrace" : 2,
+			"component" : "runtime",
+			"destination" : "lib64",
+			"paths" : 
+			[
+				"librocksdb.so"
+			],
+			"targetId" : "rocksdb-shared::@6890427a1f51a3e7e1df",
+			"targetIndex" : 123,
+			"targetInstallNamelink" : "only",
+			"type" : "target"
+		},
+		{
+			"backtrace" : 3,
+			"component" : "devel",
+			"destination" : "include/rocksdb",
+			"paths" : 
+			[
+				{
+					"from" : "include/rocksdb",
+					"to" : "."
+				}
+			],
+			"type" : "directory"
+		}
+	],
+	"paths" : 
+	{
+		"build" : ".",
+		"source" : "."
+	}
+}

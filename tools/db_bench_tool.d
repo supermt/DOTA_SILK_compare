@@ -60,4 +60,10 @@ tools/db_bench_tool.d tools/db_bench_tool.o: tools/db_bench_tool.cc \
  utilities/persistent_cache/block_cache_tier_metadata.h \
  utilities/persistent_cache/hash_table.h include/rocksdb/env.h \
  utilities/persistent_cache/hash_table_evictable.h memtable/skiplist.h \
- util/zipf.h util/latest-generator.h
+ util/zipf.h util/latest-generator.h ycsbcore/client.h ycsbcore/db.h \
+ ycsbcore/properties.h ycsbcore/utils.h ycsbcore/core_workload.h \
+ ycsbcore/acknowledged_counter_generator.h ycsbcore/counter_generator.h \
+ ycsbcore/generator.h ycsbcore/discrete_generator.h \
+ ycsbcore/countdown_latch.h ycsbcore/core_workload.h \
+ ycsbcore/countdown_latch.h ycsbcore/db_factory.h ycsbcore/measurements.h \
+ ycsbcore/measurements.h ycsbcore/timer.h ycsbcore/utils.h

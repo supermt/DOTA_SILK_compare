@@ -77,6 +77,14 @@
 #include "util/zipf.h"
 #include "util/latest-generator.h"
 
+#include "ycsbcore/client.h"
+#include "ycsbcore/core_workload.h"
+#include "ycsbcore/countdown_latch.h"
+#include "ycsbcore/db_factory.h"
+#include "ycsbcore/measurements.h"
+#include "ycsbcore/timer.h"
+#include "ycsbcore/utils.h"
+
 #ifdef OS_WIN
 #include <io.h>  // open/close
 #endif
@@ -120,13 +128,8 @@ DEFINE_string(
     "differentvaluesizesperthreadcomparison,"
     "longpeak,"
     "testzipf,"
+    "ycsb,"
     "testlatestgenerator,"
-    "ycsbwklda,"
-    "ycsbwkldb,"
-    "ycsbwkldc,"
-    "ycsbwkldd,"
-    "ycsbwklde,"
-    "ycsbwkldf,"
     "updaterandom,"
     "randomwithverify,"
     "readwriteskewedworkload,"
@@ -628,7 +631,9 @@ DEFINE_int64(max_num_range_tombstones, 0,
 
 DEFINE_bool(expand_range_tombstones, false,
             "Expand range tombstone into sequential regular tombstones.");
-
+DEFINE_string(ycsb_workload, "", "The workload of YCSB");
+DEFINE_int64(load_num, 100000, "Num of operations in loading phrase");
+DEFINE_int64(running_num, 100000, "Num of operations in running phrase");
 #ifndef ROCKSDB_LITE
 DEFINE_bool(optimistic_transaction_db, false,
             "Open a OptimisticTransactionDB instance. "
@@ -1393,6 +1398,7 @@ enum OperationType : unsigned char {
   kSeek,
   kMerge,
   kUpdate,
+  kReadModifyWrite,
   kCompress,
   kUncompress,
   kCrc,
@@ -1410,6 +1416,7 @@ static std::unordered_map<OperationType, std::string, std::hash<unsigned char>>
   {kSeek, "seek"},
   {kMerge, "merge"},
   {kUpdate, "update"},
+  {kReadModifyWrite,"read-modify-write"}
   {kCompress, "compress"},
   {kCompress, "uncompress"},
   {kCrc, "crc"},
@@ -2647,18 +2654,15 @@ void VerifyDBFromDB(std::string& truth_db_name) {
         method = &Benchmark::Zipf;
       }else if (name == "testlatestgenerator") {
         method = &Benchmark::LatestGenerator;
-      }else if (name == "ycsbwklda") {
-        method = &Benchmark::YCSBWorkloadA;
-      }else if (name == "ycsbwkldb") {
-        method = &Benchmark::YCSBWorkloadB;
-      }else if (name == "ycsbwkldc") {
-        method = &Benchmark::YCSBWorkloadC;
-      }else if (name == "ycsbwkldd") {
-        method = &Benchmark::YCSBWorkloadD;
-      }else if (name == "ycsbwklde") {
-        method = &Benchmark::YCSBWorkloadE;
-      }else if (name == "ycsbwkldf") {
-        method = &Benchmark::YCSBWorkloadF;
+      }else if (name == "ycsb") {
+        fresh_db = true;
+        method = &Benchmark::YCSBIntegrate;
+      } else if (name == "ycsb_load") {
+        fresh_db = true;
+        method = &Benchmark::YCSBLoader;
+      } else if (name == "ycsb_run") {
+        fresh_db = false;
+        method = &Benchmark::YCSBRunner;
       }else if (name == "readrandomwriterandomdifferentvaluesizes") {
         method = &Benchmark::ReadRandomWriteRandomDifferentValueSizes;
       } else if (name == "readrandomwriterandomsplitrangedifferentvaluesizes") {
@@ -5571,6 +5575,183 @@ void ReadRandomWriteRandomSplitRangeDifferentValueSizes(ThreadState* thread) {
              " total:%" PRIu64 " found:%" PRIu64 ")",
              reads_done, writes_done, readwrites_, found);
     thread->stats.AddMessage(msg);
+  }
+
+    void YCSBWorking(ThreadState* thread, ycsbc::CoreWorkload* workload, int load,
+                   int run) {
+    int remain_loading = FLAGS_load_num;
+    int remain_running = FLAGS_running_num;
+    int64_t ops_per_stage = 1;
+    const int test_duration = FLAGS_duration;
+
+    // load first, then run
+    Duration loading_duration(test_duration, remain_loading, ops_per_stage);
+    Duration running_duration(test_duration, remain_running, ops_per_stage);
+    int stage = 0;
+    //    WriteBatch batch;
+    Status s;
+    RandomGenerator gen;
+    int64_t bytes = 0;
+    Duration duration = loading_duration;
+    rocksdb::ReadOptions r_op;
+    rocksdb::WriteOptions w_op;
+    if (load) {
+      while (!duration.Done(entries_per_batch_)) {
+        DB* db = SelectDB(thread);
+        if (duration.GetStage() != stage) {
+          stage = duration.GetStage();
+          if (db_.db != nullptr) {
+            db_.CreateNewCf(open_options_, stage);
+          } else {
+            for (auto& input_db : multi_dbs_) {
+              input_db.CreateNewCf(open_options_, stage);
+            }
+          }
+        }
+        std::string key = workload->BuildKeyName();
+        Slice val = gen.Generate(value_size_);
+        db_.db->Put(w_op, key, val);
+
+        int64_t batch_bytes = 0;
+        for (int64_t j = 0; j < entries_per_batch_; j++) {
+          batch_bytes += val.size() + key.size();
+          bytes += val.size() + key.size();
+        }
+        if (thread->shared->write_rate_limiter.get() != nullptr) {
+          thread->shared->write_rate_limiter->Request(
+              batch_bytes, Env::IO_HIGH, nullptr /* stats */,
+              RateLimiter::OpType::kWrite);
+          thread->stats.ResetLastOpTime();
+        }
+        thread->stats.FinishedOps(nullptr, db, entries_per_batch_, kWrite);
+      }
+      thread->stats.AddBytes(bytes);
+    }
+
+    if (run) {
+      duration = running_duration;
+
+      Status op_status;
+      int read_count = 0;
+      int found_count = 0;
+      int blind_updates = 0;
+      while (!duration.Done(1)) {
+        if (duration.GetStage() != stage) {
+          stage = duration.GetStage();
+          if (db_.db != nullptr) {
+            db_.CreateNewCf(open_options_, stage);
+          } else {
+            for (auto& db : multi_dbs_) {
+              db.CreateNewCf(open_options_, stage);
+            }
+          }
+        }
+        std::string data;
+        uint64_t key_num = workload->NextTransactionKeyNum();
+        const std::string key = workload->BuildKeyName(key_num);
+        DB* db = SelectDB(thread);
+        switch (workload->NextOp()) {
+          case ycsbc::READ: {
+            op_status = db_.db->Get(r_op, key, &data);
+            if (op_status.ok()) {
+              found_count++;
+              bytes += key.size() + data.size();
+            }
+            read_count++;
+            thread->stats.FinishedOps(nullptr, db, entries_per_batch_, kRead);
+          } break;
+          case ycsbc::UPDATE: {
+            Slice val = gen.Generate(value_size_);
+            // In rocksdb, update is just another put operation.
+            op_status = db_.db->Put(w_op, key, val);
+            thread->stats.FinishedOps(nullptr, db, entries_per_batch_, kUpdate);
+          } break;
+          case ycsbc::INSERT: {
+            Slice val = gen.Generate(value_size_);
+            // In rocksdb, update is just another put operation.
+            op_status = db_.db->Put(w_op, key, val);
+            thread->stats.FinishedOps(nullptr, db, entries_per_batch_, kWrite);
+          } break;
+          case ycsbc::SCAN: {
+            Iterator* db_iter = db_.db->NewIterator(rocksdb::ReadOptions());
+            db_iter->Seek(key);
+            int len = workload->scan_len_chooser_->Next();
+            for (int i = 0; db_iter->Valid() && i < len; i++) {
+              data = db_iter->value().ToString();
+              db_iter->Next();
+            }
+            thread->stats.FinishedOps(nullptr, db, entries_per_batch_, kSeek);
+            delete db_iter;
+          } break;
+          case ycsbc::READMODIFYWRITE: {
+            op_status = db_.db->Get(r_op, key, &data);
+            read_count++;
+            if (op_status.IsNotFound()) {
+              blind_updates++;
+            }
+            Slice val = gen.Generate(value_size_);
+            op_status = db_.db->Put(w_op, key, val);
+            thread->stats.FinishedOps(nullptr, db, entries_per_batch_,kReadModifyWrite);
+          } break;
+          case ycsbc::DELETE: {
+            op_status = db_.db->Delete(w_op, key);
+            thread->stats.FinishedOps(nullptr, db, entries_per_batch_, kDelete);
+          } break;
+          case ycsbc::MAXOPTYPE:
+            throw ycsbc::utils::Exception(
+                "Operation request is not recognized!");
+        }
+      }
+      thread->stats.AddBytes(bytes);
+    }
+  }
+
+  void InitWorkload(ycsbc::CoreWorkload& wl, ycsbc::utils::Properties& props) {
+    if (!FLAGS_ycsb_workload.empty()) {
+      std::ifstream input(FLAGS_ycsb_workload);
+      props.Load(input);
+    }
+//    std::cout << "load op" << FLAGS_load_num << std::endl;
+//      props.SetProperty(ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY,
+//                        std::to_string(FLAGS_load_num));
+//      props.SetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY,
+//                        std::to_string(FLAGS_running_num));
+    if (props.GetProperty(ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY).empty()) {
+      props.SetProperty(ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY,
+                        std::to_string(FLAGS_load_num));
+    } else {
+      FLAGS_load_num = std::stoi(
+          props.GetProperty(ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY));
+    }
+    if (props.GetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY)
+            .empty()) {
+      props.SetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY,
+                        std::to_string(FLAGS_load_num));
+    } else {
+      FLAGS_running_num = std::stoi(
+          props.GetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY));
+    }
+    wl.Init(props);
+  }
+  void YCSBLoader(ThreadState* thread) {
+    ycsbc::CoreWorkload wl;
+    ycsbc::utils::Properties props;
+    InitWorkload(wl, props);
+    YCSBWorking(thread, &wl, true, false);
+  }
+  void YCSBRunner(ThreadState* thread) {
+    ycsbc::CoreWorkload wl;
+    ycsbc::utils::Properties props;
+    InitWorkload(wl, props);
+    YCSBWorking(thread, &wl, false, true);
+  }
+
+  void YCSBIntegrate(ThreadState* thread) {
+    ycsbc::CoreWorkload wl;
+    ycsbc::utils::Properties props;
+
+    InitWorkload(wl, props);
+    YCSBWorking(thread, &wl, true, true);
   }
 
    // Workload A: Update heavy workload

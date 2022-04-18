@@ -206,6 +206,12 @@ LIB_SOURCES =                                                   \
   utilities/ttl/db_ttl_impl.cc                                  \
   utilities/write_batch_with_index/write_batch_with_index.cc    \
   utilities/write_batch_with_index/write_batch_with_index_internal.cc    \
+        ycsbcore/acknowledged_counter_generator.cc						\
+        ycsbcore/basic_db.cc											\
+	ycsbcore/core_workload.cc											\
+        ycsbcore/db_factory.cc											\
+        ycsbcore/measurements.cc								\
+        ycsbcore/ycsbc.cc
 
 TOOL_LIB_SOURCES = \
   tools/ldb_cmd.cc                                               \
