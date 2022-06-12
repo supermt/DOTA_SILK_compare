@@ -5731,26 +5731,10 @@ void InitWorkload(ycsbc::CoreWorkload& wl, ycsbc::utils::Properties& props) {
         std::ifstream input(FLAGS_ycsb_workload);
         props.Load(input);
     }
-    //    std::cout << "load op" << FLAGS_load_num << std::endl;
-    //      props.SetProperty(ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY,
-    //                        std::to_string(FLAGS_load_num));
-    //      props.SetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY,
-    //                        std::to_string(FLAGS_running_num));
-    if (props.GetProperty(ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY).empty()) {
-        props.SetProperty(ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY,
-                std::to_string(FLAGS_load_num));
-    } else {
-        FLAGS_load_num = std::stoi(
-                props.GetProperty(ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY));
-    }
-    if (props.GetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY)
-            .empty()) {
-        props.SetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY,
-                std::to_string(FLAGS_load_num));
-    } else {
-        FLAGS_running_num = std::stoi(
-                props.GetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY));
-    }
+    props.SetProperty(ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY,
+                            std::to_string(FLAGS_load_num));
+    props.SetProperty(ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY,
+                            std::to_string(FLAGS_running_num)); 
     wl.Init(props);
 }
 void YCSBLoader(ThreadState* thread) {
@@ -5769,7 +5753,6 @@ void YCSBRunner(ThreadState* thread) {
 void YCSBIntegrate(ThreadState* thread) {
     ycsbc::CoreWorkload wl;
     ycsbc::utils::Properties props;
-
     InitWorkload(wl, props);
     YCSBWorking(thread, &wl, true, true);
 }
