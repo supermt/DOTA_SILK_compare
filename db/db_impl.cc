@@ -980,7 +980,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options,
     sv->current->Get(read_options, lkey, pinnable_val, &s, &merge_context,
                      &range_del_agg, value_found);
     RecordTick(stats_, MEMTABLE_MISS);
-    s = Status::TryAgain();
+    //s = Status::TryAgain();
     //READ from DISK <-- shouldn't do this. Should return and re-schedule in a different queue. 
   }
 

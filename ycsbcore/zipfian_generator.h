@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <mutex>
 
+#include <iostream>
 #include "generator.h"
 #include "utils.h"
 
@@ -46,7 +47,8 @@ class ZipfianGenerator : public Generator<uint64_t> {
 
   uint64_t Next(uint64_t num_items);
 
-  uint64_t Next() { return Next(items_); }
+  uint64_t Next() {
+      return Next(items_); }
 
   uint64_t Last();
 
@@ -93,12 +95,14 @@ inline uint64_t ZipfianGenerator::Next(uint64_t num) {
       zeta_n_ = Zeta(count_for_zeta_, num, theta_, zeta_n_);
       count_for_zeta_ = num;
       eta_ = Eta();
+
+//     std::cout << "item value:" <<eta_ <<std::endl;
     } else if (num < count_for_zeta_ && allow_count_decrease_) {
       // TODO
     }
   }
 
-  double u = utils::ThreadLocalRandomDouble();
+ double u = utils::ThreadLocalRandomDouble();
   double uz = u * zeta_n_;
 
   if (uz < 1.0) {
@@ -108,8 +112,9 @@ inline uint64_t ZipfianGenerator::Next(uint64_t num) {
   if (uz < 1.0 + std::pow(0.5, theta_)) {
     return last_value_ = base_ + 1;
   }
+  last_value_ = base_ + num * std::pow(eta_ * u - eta_ + 1, alpha_); 
+  return last_value_;
 
-  return last_value_ = base_ + num * std::pow(eta_ * u - eta_ + 1, alpha_);
 }
 
 inline uint64_t ZipfianGenerator::Last() {

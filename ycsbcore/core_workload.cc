@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <random>
 #include <string>
+#include <iostream>
 
 #include "const_generator.h"
 #include "random_byte_generator.h"
@@ -110,6 +111,7 @@ void CoreWorkload::Init(const utils::Properties &p) {
       READMODIFYWRITE_PROPORTION_PROPERTY, READMODIFYWRITE_PROPORTION_DEFAULT));
 
   record_count_ = std::stoi(p.GetProperty(RECORD_COUNT_PROPERTY));
+  
   std::string request_dist = p.GetProperty(REQUEST_DISTRIBUTION_PROPERTY,
                                            REQUEST_DISTRIBUTION_DEFAULT);
   int min_scan_len = std::stoi(
@@ -168,7 +170,11 @@ void CoreWorkload::Init(const utils::Properties &p) {
     int new_keys = (int)(op_count * insert_proportion * 2);  // a fudge factor
     key_chooser_ = new ScrambledZipfianGenerator(record_count_ + new_keys);
 
-  } else if (request_dist == "latest") {
+    std::cout << "insert start:" <<insert_start <<std::endl;
+    std::cout << "record count:" <<record_count_ <<std::endl;
+    std::cout << "op count:" <<op_count <<std::endl;
+    std::cout << "new keys:" <<new_keys <<std::endl;
+ } else if (request_dist == "latest") {
     key_chooser_ = new SkewedLatestGenerator(*transaction_insert_key_sequence_);
 
   } else {
@@ -216,6 +222,7 @@ std::string CoreWorkload::BuildKeyName(uint64_t key_num) {
   }
   std::string prekey = "user";
   std::string value = std::to_string(key_num);
+
   int fill = std::max(0, zero_padding_ - static_cast<int>(value.size()));
   return prekey.append(fill, '0').append(value);
 }
