@@ -899,6 +899,15 @@ struct DBOptions {
   // relies on manual invocation of FlushWAL to write the WAL buffer to its
   // file.
   bool manual_wal_flush = false;
+
+    /// for FEAT
+  // This is an immutable option, that indicates the max core number we can use
+  // in the system.
+  uint64_t core_number = 20;
+  // Here is the max size of target system. It surppose to be immutable, but
+  // who knows.
+  uint64_t max_memtable_size = 512 << 20;
+
 };
 
 // Options to control the behavior of a database (passed to DB::Open)

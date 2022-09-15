@@ -81,6 +81,11 @@ struct ImmutableDBOptions {
   bool allow_ingest_behind;
   bool concurrent_prepare;
   bool manual_wal_flush;
+
+  uint64_t core_number;
+  uint64_t max_memtable_size;
+  std::shared_ptr<std::vector<QuicksandMetrics>> job_stats;
+  std::shared_ptr<std::vector<FlushMetrics>> flush_stats;
 };
 
 struct MutableDBOptions {

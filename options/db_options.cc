@@ -88,7 +88,11 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       avoid_flush_during_recovery(options.avoid_flush_during_recovery),
       allow_ingest_behind(options.allow_ingest_behind),
       concurrent_prepare(options.concurrent_prepare),
-      manual_wal_flush(options.manual_wal_flush) {
+      manual_wal_flush(options.manual_wal_flush),core_number(options.core_number),
+      max_memtable_size(options.max_memtable_size)  {
+
+  job_stats = std::make_shared<std::vector<QuicksandMetrics>>();
+  flush_stats = std::make_shared<std::vector<FlushMetrics>>();
 }
 
 void ImmutableDBOptions::Dump(Logger* log) const {

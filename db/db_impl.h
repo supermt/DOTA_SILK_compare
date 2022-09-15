@@ -565,7 +565,8 @@ class DBImpl : public DB {
 
   Status NewDB();
 
- protected:
+  VersionSet* GetVersionSet(){return versions_.get();}
+ public:
   Env* const env_;
   const std::string dbname_;
   unique_ptr<VersionSet> versions_;

@@ -631,13 +631,32 @@ DEFINE_int64(max_num_range_tombstones, 0,
 
 DEFINE_bool(expand_range_tombstones, false,
             "Expand range tombstone into sequential regular tombstones.");
+uint64_t kMicrosInSecond = 1000l * 1000l;
 DEFINE_int64(load_duration, 0, "The loading duration of YCSB");
 DEFINE_string(ycsb_workload, "", "The workload of YCSB");
 DEFINE_int64(ycsb_request_speed, 100, "The request speed of YCSB, in MB/s");
 DEFINE_int64(load_num, 100000, "Num of operations in loading phrase");
+DEFINE_int64(running_num, 100000, "Num of operations in running phrase");
+DEFINE_int64(core_num, 20, "The limit of thread number");
+DEFINE_int64(max_memtable_size, rocksdb::Options().max_memtable_size,
+             "The size of Max batch size");
+DEFINE_bool(DOTA_enable, false, "Whether trigger the DOTA framework");
+DEFINE_bool(FEA_enable, false, "Trigger FEAT tuner's FEA component");
+DEFINE_bool(TEA_enable, false, "Trigger FEAT tuner's TEA component");
+DEFINE_int32(SILK_bandwidth_limitation, 200, "MBPS of disk limitation");
+DEFINE_bool(SILK_triggered, false, "Whether the SILK tuner is triggered");
+DEFINE_double(idle_rate, 1.25,
+              "TEA will decide this as the idle rate of the threads");
+DEFINE_double(FEA_gap_threshold, 1.5,
+              "The negative feedback loop's threshold");
+DEFINE_double(TEA_slow_flush, 0.5, "The negative feedback loop's threshold");
+DEFINE_double(DOTA_tuning_gap, 1.0, "Tuning gap of the DOTA agent, in secs ");
 DEFINE_int64(random_fill_average, 150,
              "average inputs rate of background write operations");
-DEFINE_int64(running_num, 100000, "Num of operations in running phrase");
+DEFINE_bool(detailed_running_stats, false,
+            "Whether record more detailed information in report agent");
+
+
 #ifndef ROCKSDB_LITE
 DEFINE_bool(optimistic_transaction_db, false,
             "Open a OptimisticTransactionDB instance. "
@@ -850,8 +869,6 @@ DEFINE_int32(rate_limit_delay_max_milliseconds, 1000,
 DEFINE_int32(SILK_bandwidth_check_interval, 10000,
              "How  much time to wait between sampling the bandwidth and adjusting compaction rate in SILK");
 
-
-DEFINE_int32(SILK_bandwidth_limitation,200,"MBPS of disk limitation");
 DEFINE_uint64(rate_limiter_bytes_per_sec, 0, "Set options.rate_limiter value.");
 
 DEFINE_bool(rate_limit_bg_reads, false,
@@ -1553,6 +1570,774 @@ static void AppendWithSpace(std::string* str, Slice msg) {
   str->append(msg.data(), msg.size());
 }
 
+enum ThreadStallLevels : int {
+  //  kLowFlush,
+  kL0Stall,
+  kPendingBytes,
+  kGoodArea,
+  kIdle,
+  kBandwidthCongestion
+};
+enum BatchSizeStallLevels : int {
+  kTinyMemtable,  // tiny memtable
+  kStallFree,
+  kOverFrequent
+};
+
+struct SystemScores {
+  // Memory Component
+  uint64_t memtable_speed;   // MB per sec
+  double active_size_ratio;  // active size / total memtable size
+  int immutable_number;      // NonFlush number
+  // Flushing
+  double flush_speed_avg;
+  double flush_min;
+  double flush_speed_var;
+  // Compaction speed
+  double l0_num;
+  // LSM  size
+  double l0_drop_ratio;
+  double estimate_compaction_bytes;  // given by the system, divided by the soft
+                                     // limit
+  // System metrics
+  double disk_bandwidth;  // avg
+  double flush_idle_time;
+  double flush_gap_time;
+  double compaction_idle_time;  // calculate by idle calculating,flush and
+                                // compaction stats separately
+  int flush_numbers;
+
+  SystemScores() {
+    memtable_speed = 0.0;
+    active_size_ratio = 0.0;
+    immutable_number = 0;
+    flush_speed_avg = 0.0;
+    flush_min = 9999999;
+    flush_speed_var = 0.0;
+    l0_num = 0.0;
+    l0_drop_ratio = 0.0;
+    estimate_compaction_bytes = 0.0;
+    disk_bandwidth = 0.0;
+    compaction_idle_time = 0.0;
+    flush_numbers = 0;
+    flush_gap_time = 0;
+  }
+  void Reset() {
+    memtable_speed = 0.0;
+    active_size_ratio = 0.0;
+    immutable_number = 0;
+    flush_speed_avg = 0.0;
+    flush_speed_var = 0.0;
+    l0_num = 0.0;
+    l0_drop_ratio = 0.0;
+    estimate_compaction_bytes = 0.0;
+    disk_bandwidth = 0.0;
+    compaction_idle_time = 0.0;
+    flush_numbers = 0;
+    flush_gap_time = 0;
+  }
+  SystemScores operator-(const SystemScores& a);
+  SystemScores operator+(const SystemScores& a);
+  SystemScores operator/(const int& a);
+};
+
+typedef SystemScores ScoreGradient;
+
+struct ChangePoint {
+  std::string opt;
+  std::string value;
+  int change_timing;
+  bool db_width;
+};
+enum OpType : int { kLinearIncrease, kHalf, kKeep };
+struct TuningOP {
+  OpType BatchOp;
+  OpType ThreadOp;
+};
+class DOTA_Tuner {
+ protected:
+  const Options default_opts;
+  uint64_t tuning_rounds;
+  Options current_opt;
+  Version* version;
+  ColumnFamilyData* cfd;
+  VersionStorageInfo* vfs;
+  DBImpl* running_db_;
+  int64_t* last_report_ptr;
+  std::atomic<int64_t>* total_ops_done_ptr_;
+  std::deque<SystemScores> scores;
+  std::vector<ScoreGradient> gradients;
+  int current_sec;
+  uint64_t flush_list_accessed, compaction_list_accessed;
+  ThreadStallLevels last_thread_states;
+  BatchSizeStallLevels last_batch_stat;
+  std::shared_ptr<std::vector<FlushMetrics>> flush_list_from_opt_ptr;
+  std::shared_ptr<std::vector<QuicksandMetrics>> compaction_list_from_opt_ptr;
+  SystemScores max_scores;
+  SystemScores avg_scores;
+  uint64_t last_flush_thread_len;
+  uint64_t last_compaction_thread_len;
+  Env* env_;
+  double tuning_gap;
+  int double_ratio = 2;
+  uint64_t last_unflushed_bytes = 0;
+  const int score_array_len = 600 / tuning_gap;
+  double idle_threshold = 2.5;
+  double FEA_gap_threshold = 1;
+  double TEA_slow_flush = 0.5;
+  uint64_t last_non_zero_flush = 0;
+  void UpdateSystemStats() { UpdateSystemStats(running_db_); }
+
+ public:
+  DOTA_Tuner(const Options opt, DBImpl* running_db, int64_t* last_report_op_ptr,
+             std::atomic<int64_t>* total_ops_done_ptr, Env* env,
+             uint64_t gap_sec)
+      : default_opts(opt),
+        tuning_rounds(0),
+        running_db_(running_db),
+        scores(),
+        gradients(0),
+        current_sec(0),
+        flush_list_accessed(0),
+        compaction_list_accessed(0),
+        last_thread_states(kL0Stall),
+        last_batch_stat(kTinyMemtable),
+        flush_list_from_opt_ptr(running_db->immutable_db_options().flush_stats),
+        compaction_list_from_opt_ptr(
+            running_db->immutable_db_options().job_stats),
+        max_scores(),
+        last_flush_thread_len(0),
+        last_compaction_thread_len(0),
+        env_(env),
+        tuning_gap(gap_sec),
+        core_num(running_db->immutable_db_options().core_number),
+        max_memtable_size(
+            running_db->immutable_db_options().max_memtable_size) {
+    this->last_report_ptr = last_report_op_ptr;
+    this->total_ops_done_ptr_ = total_ops_done_ptr;
+  }
+  void set_idle_ratio(double idle_ra) { idle_threshold = idle_ra; }
+  void set_gap_threshold(double ng_threshold) {
+    FEA_gap_threshold = ng_threshold;
+  }
+  void set_slow_flush_threshold(double sf_threshold) {
+    this->TEA_slow_flush = sf_threshold;
+  }
+  virtual ~DOTA_Tuner();
+
+  inline void UpdateMaxScore(SystemScores& current_score) {
+    //    if (!scores.empty() &&
+    //        current_score.memtable_speed > scores.front().memtable_speed * 2)
+    //        {
+    //      // this would be an error
+    //      return;
+    //    }
+
+    if (current_score.memtable_speed > max_scores.memtable_speed) {
+      max_scores.memtable_speed = current_score.memtable_speed;
+    }
+    if (current_score.active_size_ratio > max_scores.active_size_ratio) {
+      max_scores.active_size_ratio = current_score.active_size_ratio;
+    }
+    if (current_score.immutable_number > max_scores.immutable_number) {
+      max_scores.immutable_number = current_score.immutable_number;
+    }
+
+    if (current_score.flush_speed_avg > max_scores.flush_speed_avg) {
+      max_scores.flush_speed_avg = current_score.flush_speed_avg;
+    }
+    if (current_score.flush_speed_var > max_scores.flush_speed_var) {
+      max_scores.flush_speed_var = current_score.flush_speed_var;
+    }
+    if (current_score.l0_num > max_scores.l0_num) {
+      max_scores.l0_num = current_score.l0_num;
+    }
+    if (current_score.l0_drop_ratio > max_scores.l0_drop_ratio) {
+      max_scores.l0_drop_ratio = current_score.l0_drop_ratio;
+    }
+    if (current_score.estimate_compaction_bytes >
+        max_scores.estimate_compaction_bytes) {
+      max_scores.estimate_compaction_bytes =
+          current_score.estimate_compaction_bytes;
+    }
+    if (current_score.disk_bandwidth > max_scores.disk_bandwidth) {
+      max_scores.disk_bandwidth = current_score.disk_bandwidth;
+    }
+    if (current_score.flush_idle_time > max_scores.flush_idle_time) {
+      max_scores.flush_idle_time = current_score.flush_idle_time;
+    }
+    if (current_score.compaction_idle_time > max_scores.compaction_idle_time) {
+      max_scores.compaction_idle_time = current_score.compaction_idle_time;
+    }
+    if (current_score.flush_numbers > max_scores.flush_numbers) {
+      max_scores.flush_numbers = current_score.flush_numbers;
+    }
+  }
+
+  void ResetTuner() { tuning_rounds = 0; }
+  void UpdateSystemStats(DBImpl* running_db) {
+    current_opt = running_db->GetOptions();
+    version = running_db->GetVersionSet()
+                  ->GetColumnFamilySet()
+                  ->GetDefault()
+                  ->current();
+    cfd = version->cfd();
+    vfs = version->storage_info();
+  }
+  virtual void DetectTuningOperations(int secs_elapsed,
+                                      std::vector<ChangePoint>* change_list);
+
+  ScoreGradient CompareWithBefore() { return scores.back() - scores.front(); }
+  ScoreGradient CompareWithBefore(SystemScores& past_score) {
+    return scores.back() - past_score;
+  }
+  ScoreGradient CompareWithBefore(SystemScores& past_score,
+                                  SystemScores& current_score) {
+    return current_score - past_score;
+  }
+  ThreadStallLevels LocateThreadStates(SystemScores& score);
+  BatchSizeStallLevels LocateBatchStates(SystemScores& score);
+
+  const std::string memtable_size = "write_buffer_size";
+  const std::string sst_size = "target_file_size_base";
+  const std::string total_l1_size = "max_bytes_for_level_base";
+  const std::string max_bg_jobs = "max_background_jobs";
+  const std::string memtable_number = "max_write_buffer_number";
+
+  const int core_num;
+  int max_thread = core_num;
+  const int min_thread = 2;
+  uint64_t max_memtable_size;
+  const uint64_t min_memtable_size = 64 << 20;
+
+  SystemScores ScoreTheSystem();
+  void AdjustmentTuning(std::vector<ChangePoint>* change_list,
+                        SystemScores& score, ThreadStallLevels levels,
+                        BatchSizeStallLevels stallLevels);
+  TuningOP VoteForOP(SystemScores& current_score, ThreadStallLevels levels,
+                     BatchSizeStallLevels stallLevels);
+  void FillUpChangeList(std::vector<ChangePoint>* change_list, TuningOP op);
+  void SetBatchSize(std::vector<ChangePoint>* change_list,
+                    uint64_t target_value);
+  void SetThreadNum(std::vector<ChangePoint>* change_list, int target_value);
+};
+
+enum Stage : int { kSlowStart, kStabilizing };
+class FEAT_Tuner : public DOTA_Tuner {
+ public:
+  FEAT_Tuner(const Options opt, DBImpl* running_db, int64_t* last_report_op_ptr,
+             std::atomic<int64_t>* total_ops_done_ptr, Env* env, int gap_sec,
+             bool triggerTEA, bool triggerFEA)
+      : DOTA_Tuner(opt, running_db, last_report_op_ptr, total_ops_done_ptr, env,
+                   gap_sec),
+        TEA_enable(triggerTEA),
+        FEA_enable(triggerFEA),
+        current_stage(kSlowStart) {
+    flush_list_from_opt_ptr =
+        this->running_db_->immutable_db_options().flush_stats;
+
+    std::cout << "Using FEAT tuner.\n FEA is "
+              << (FEA_enable ? "triggered" : "NOT triggered") << std::endl;
+    std::cout << "TEA is " << (TEA_enable ? "triggered" : "NOT triggered")
+              << std::endl;
+  }
+  void DetectTuningOperations(int secs_elapsed,
+                              std::vector<ChangePoint>* change_list) override;
+  ~FEAT_Tuner() override;
+
+  TuningOP TuneByTEA();
+  TuningOP TuneByFEA();
+
+ private:
+  bool TEA_enable;
+  bool FEA_enable;
+  SystemScores current_score_;
+  SystemScores head_score_;
+  std::deque<TuningOP> recent_ops;
+  Stage current_stage;
+  double bandwidth_congestion_threshold = 0.7;
+  double slow_down_threshold = 0.75;
+  double RO_threshold = 0.8;
+  double LO_threshold = 0.7;
+  double MO_threshold = 0.5;
+  double batch_changing_frequency = 0.7;
+  int congestion_threads = min_thread;
+  //  int double_ratio = 4;
+  SystemScores normalize(SystemScores& origin_score);
+
+  inline const char* StageString(Stage v) {
+    switch (v) {
+      case kSlowStart:
+        return "slow start";
+        //      case kBoundaryDetection:
+        //        return "Boundary Detection";
+      case kStabilizing:
+        return "Stabilizing";
+    }
+    return "unknown operation";
+  }
+  void CalculateAvgScore();
+};
+inline const char* OpString(OpType v) {
+  switch (v) {
+    case kLinearIncrease:
+      return "Linear Increase";
+    case kHalf:
+      return "Half";
+    case kKeep:
+      return "Keep";
+  }
+  return "unknown operation";
+}
+
+
+DOTA_Tuner::~DOTA_Tuner() = default;
+void DOTA_Tuner::DetectTuningOperations(
+    int secs_elapsed, std::vector<ChangePoint> *change_list_ptr) {
+  current_sec = secs_elapsed;
+  //  UpdateSystemStats();
+  SystemScores current_score = ScoreTheSystem();
+  UpdateMaxScore(current_score);
+  scores.push_back(current_score);
+  gradients.push_back(current_score - scores.front());
+
+  auto thread_stat = LocateThreadStates(current_score);
+  auto batch_stat = LocateBatchStates(current_score);
+
+  AdjustmentTuning(change_list_ptr, current_score, thread_stat, batch_stat);
+  // decide the operation based on the best behavior and last behavior
+  // update the histories
+  last_thread_states = thread_stat;
+  last_batch_stat = batch_stat;
+  tuning_rounds++;
+}
+ThreadStallLevels DOTA_Tuner::LocateThreadStates(SystemScores &score) {
+  if (score.memtable_speed < max_scores.memtable_speed * 0.7) {
+    // speed is slower than before, performance is in the stall area
+    if (score.immutable_number >= 1) {
+      if (score.flush_speed_avg <= max_scores.flush_speed_avg * 0.5) {
+        // it's not influenced by the flushing speed
+        if (current_opt.max_background_jobs > 6) {
+          return kBandwidthCongestion;
+        }
+        //        else {
+        //          return kLowFlush;
+        //        }
+      } else if (score.l0_num > 0.5) {
+        // it's in the l0 stall
+        return kL0Stall;
+      }
+    } else if (score.l0_num > 0.7) {
+      // it's in the l0 stall
+      return kL0Stall;
+    } else if (score.estimate_compaction_bytes > 0.5) {
+      return kPendingBytes;
+    }
+  } else if (score.compaction_idle_time > 2.5) {
+    return kIdle;
+  }
+  return kGoodArea;
+}
+
+BatchSizeStallLevels DOTA_Tuner::LocateBatchStates(SystemScores &score) {
+  if (score.memtable_speed < max_scores.memtable_speed * 0.7) {
+    if (score.flush_speed_avg < max_scores.flush_speed_avg * 0.5) {
+      if (score.active_size_ratio > 0.5 && score.immutable_number >= 1) {
+        return kTinyMemtable;
+      } else if (current_opt.max_background_jobs > 6 || score.l0_num > 0.9) {
+        return kTinyMemtable;
+      }
+    }
+  } else if (score.flush_numbers < max_scores.flush_numbers * 0.3) {
+    return kOverFrequent;
+  }
+
+  return kStallFree;
+};
+
+SystemScores DOTA_Tuner::ScoreTheSystem() {
+  UpdateSystemStats();
+  SystemScores current_score;
+
+  uint64_t total_mem_size = 0;
+  uint64_t active_mem = 0;
+  running_db_->GetIntProperty("rocksdb.size-all-mem-tables", &total_mem_size);
+  running_db_->GetIntProperty("rocksdb.cur-size-active-mem-table", &active_mem);
+
+  current_score.active_size_ratio =
+      (double)active_mem / (double)current_opt.write_buffer_size;
+  current_score.immutable_number =
+      cfd->imm() == nullptr ? 0 : cfd->imm()->NumNotFlushed();
+
+  std::vector<FlushMetrics> flush_metric_list;
+
+  auto flush_result_length =
+      running_db_->immutable_db_options().flush_stats->size();
+
+
+  auto compaction_result_length =
+      running_db_->immutable_db_options().job_stats->size();
+
+  for (uint64_t i = flush_list_accessed; i < flush_result_length; i++) {
+    auto temp = flush_list_from_opt_ptr->at(i);
+    current_score.flush_min =
+        std::min(current_score.flush_speed_avg, current_score.flush_min);
+    flush_metric_list.push_back(temp);
+    current_score.flush_speed_avg += temp.write_out_bandwidth;
+    current_score.disk_bandwidth += temp.total_bytes;
+    last_non_zero_flush = temp.write_out_bandwidth;
+    if (current_score.l0_num > temp.l0_files) {
+      current_score.l0_num = temp.l0_files;
+    }
+  }
+  int l0_compaction = 0;
+  auto num_new_flushes = (flush_result_length - flush_list_accessed);
+  current_score.flush_numbers = num_new_flushes;
+
+  while (total_mem_size < last_unflushed_bytes) {
+    total_mem_size += current_opt.write_buffer_size;
+  }
+  current_score.memtable_speed += (total_mem_size - last_unflushed_bytes);
+
+  current_score.memtable_speed /= tuning_gap;
+  current_score.memtable_speed /= kMicrosInSecond;  // we use MiB to calculate
+
+  uint64_t max_pending_bytes = 0;
+
+  last_unflushed_bytes = total_mem_size;
+  for (uint64_t i = compaction_list_accessed; i < compaction_result_length;
+       i++) {
+    auto temp = compaction_list_from_opt_ptr->at(i);
+    if (temp.input_level == 0) {
+      current_score.l0_drop_ratio += temp.drop_ratio;
+      l0_compaction++;
+    }
+    if (temp.current_pending_bytes > max_pending_bytes) {
+      max_pending_bytes = temp.current_pending_bytes;
+    }
+    current_score.disk_bandwidth += temp.total_bytes;
+  }
+
+  // flush_speed_avg,flush_speed_var,l0_drop_ratio
+  if (num_new_flushes != 0) {
+    auto avg_flush = current_score.flush_speed_avg / num_new_flushes;
+    current_score.flush_speed_avg /= num_new_flushes;
+    for (auto item : flush_metric_list) {
+      current_score.flush_speed_var += (item.write_out_bandwidth - avg_flush) *
+                                       (item.write_out_bandwidth - avg_flush);
+    }
+    current_score.flush_speed_var /= num_new_flushes;
+    current_score.flush_gap_time /= (kMicrosInSecond * num_new_flushes);
+  }
+
+  if (l0_compaction != 0) {
+    current_score.l0_drop_ratio /= l0_compaction;
+  }
+  // l0_num
+
+  current_score.l0_num = (double)(vfs->NumLevelFiles(vfs->base_level())) /
+                         current_opt.level0_slowdown_writes_trigger;
+  //std::cout << "currenct score, l0 number" << current_score.l0_num <<std::endl;
+  //  current_score.l0_num = l0_compaction == 0 ? current_score.l0_num : 0;
+  // disk bandwidth,estimate_pending_bytes ratio
+  current_score.disk_bandwidth /= kMicrosInSecond;
+
+  current_score.estimate_compaction_bytes =
+      (double)vfs->estimated_compaction_needed_bytes() /
+      current_opt.soft_pending_compaction_bytes_limit;
+
+  // clean up
+  flush_list_accessed = flush_result_length;
+  compaction_list_accessed = compaction_result_length;
+  return current_score;
+}
+
+void DOTA_Tuner::AdjustmentTuning(std::vector<ChangePoint> *change_list,
+                                  SystemScores &score,
+                                  ThreadStallLevels thread_levels,
+                                  BatchSizeStallLevels batch_levels) {
+  // tune for thread number
+  auto tuning_op = VoteForOP(score, thread_levels, batch_levels);
+  // tune for memtable
+  FillUpChangeList(change_list, tuning_op);
+}
+TuningOP DOTA_Tuner::VoteForOP(SystemScores & /*current_score*/,
+                               ThreadStallLevels thread_level,
+                               BatchSizeStallLevels batch_level) {
+  TuningOP op;
+  switch (thread_level) {
+      //    case kLowFlush:
+      //      op.ThreadOp = kDouble;
+      //      break;
+    case kL0Stall:
+      op.ThreadOp = kLinearIncrease;
+      break;
+    case kPendingBytes:
+      op.ThreadOp = kLinearIncrease;
+      break;
+    case kGoodArea:
+      op.ThreadOp = kKeep;
+      break;
+    case kIdle:
+      op.ThreadOp = kHalf;
+      break;
+    case kBandwidthCongestion:
+      op.ThreadOp = kHalf;
+      break;
+  }
+
+  if (batch_level == kTinyMemtable) {
+    op.BatchOp = kLinearIncrease;
+  } else if (batch_level == kStallFree) {
+    op.BatchOp = kKeep;
+  } else {
+    op.BatchOp = kHalf;
+  }
+
+  return op;
+}
+
+inline void DOTA_Tuner::SetThreadNum(std::vector<ChangePoint> *change_list,
+                                     int target_value) {
+  ChangePoint thread_num_cp;
+  thread_num_cp.opt = max_bg_jobs;
+  thread_num_cp.db_width = true;
+  target_value = std::max(target_value, min_thread);
+  target_value = std::min(target_value, max_thread);
+  thread_num_cp.value = std::to_string(target_value);
+  change_list->push_back(thread_num_cp);
+}
+
+inline void DOTA_Tuner::SetBatchSize(std::vector<ChangePoint> *change_list,
+                                     uint64_t target_value) {
+  ChangePoint memtable_size_cp;
+  ChangePoint L1_total_size;
+  ChangePoint sst_size_cp;
+  //  ChangePoint write_buffer_number;
+
+  sst_size_cp.opt = sst_size;
+  L1_total_size.opt = total_l1_size;
+  // adjust the memtable size
+  memtable_size_cp.db_width = false;
+  memtable_size_cp.opt = memtable_size;
+
+  target_value = std::max(target_value, min_memtable_size);
+  target_value = std::min(target_value, max_memtable_size);
+
+  // SST sizes should be controlled to be the same as memtable size
+  memtable_size_cp.value = std::to_string(target_value);
+  sst_size_cp.value = std::to_string(target_value);
+
+  // calculate the total size of L1
+  uint64_t l1_size = current_opt.level0_file_num_compaction_trigger *
+                     current_opt.min_write_buffer_number_to_merge *
+                     target_value;
+
+  L1_total_size.value = std::to_string(l1_size);
+  sst_size_cp.db_width = false;
+  L1_total_size.db_width = false;
+
+  //  change_list->push_back(write_buffer_number);
+  change_list->push_back(memtable_size_cp);
+  change_list->push_back(L1_total_size);
+  change_list->push_back(sst_size_cp);
+}
+
+void DOTA_Tuner::FillUpChangeList(std::vector<ChangePoint> *change_list,
+                                  TuningOP op) {
+  uint64_t current_thread_num = current_opt.max_background_jobs;
+  uint64_t current_batch_size = current_opt.write_buffer_size;
+  switch (op.BatchOp) {
+    case kLinearIncrease:
+      SetBatchSize(change_list,
+                   current_batch_size += default_opts.write_buffer_size);
+      break;
+    case kHalf:
+      SetBatchSize(change_list, current_batch_size /= 2);
+      break;
+    case kKeep:
+      break;
+  }
+  switch (op.ThreadOp) {
+    case kLinearIncrease:
+      SetThreadNum(change_list, current_thread_num += 2);
+      break;
+    case kHalf:
+      SetThreadNum(change_list, current_thread_num /= 2);
+      break;
+    case kKeep:
+      break;
+  }
+}
+
+SystemScores SystemScores::operator-(const SystemScores &a) {
+  SystemScores temp;
+
+  temp.memtable_speed = this->memtable_speed - a.memtable_speed;
+  temp.active_size_ratio = this->active_size_ratio - a.active_size_ratio;
+  temp.immutable_number = this->immutable_number - a.immutable_number;
+  temp.flush_speed_avg = this->flush_speed_avg - a.flush_speed_avg;
+  temp.flush_speed_var = this->flush_speed_var - a.flush_speed_var;
+  temp.l0_num = this->l0_num - a.l0_num;
+  temp.l0_drop_ratio = this->l0_drop_ratio - a.l0_drop_ratio;
+  temp.estimate_compaction_bytes =
+      this->estimate_compaction_bytes - a.estimate_compaction_bytes;
+  temp.disk_bandwidth = this->disk_bandwidth - a.disk_bandwidth;
+  temp.compaction_idle_time =
+      this->compaction_idle_time - a.compaction_idle_time;
+  temp.flush_idle_time = this->flush_idle_time - a.flush_idle_time;
+  temp.flush_gap_time = this->flush_gap_time - a.flush_gap_time;
+  temp.flush_numbers = this->flush_numbers - a.flush_numbers;
+
+  return temp;
+}
+
+SystemScores SystemScores::operator+(const SystemScores &a) {
+  SystemScores temp;
+  temp.flush_numbers = this->flush_numbers + a.flush_numbers;
+  temp.memtable_speed = this->memtable_speed + a.memtable_speed;
+  temp.active_size_ratio = this->active_size_ratio + a.active_size_ratio;
+  temp.immutable_number = this->immutable_number + a.immutable_number;
+  temp.flush_speed_avg = this->flush_speed_avg + a.flush_speed_avg;
+  temp.flush_speed_var = this->flush_speed_var + a.flush_speed_var;
+  temp.l0_num = this->l0_num + a.l0_num;
+  temp.l0_drop_ratio = this->l0_drop_ratio + a.l0_drop_ratio;
+  temp.estimate_compaction_bytes =
+      this->estimate_compaction_bytes + a.estimate_compaction_bytes;
+  temp.disk_bandwidth = this->disk_bandwidth + a.disk_bandwidth;
+  temp.compaction_idle_time =
+      this->compaction_idle_time + a.compaction_idle_time;
+  temp.flush_idle_time = this->flush_idle_time + a.flush_idle_time;
+  temp.flush_gap_time = this->flush_gap_time + a.flush_gap_time;
+  return temp;
+}
+
+SystemScores SystemScores::operator/(const int &a) {
+  SystemScores temp;
+
+  temp.memtable_speed = this->memtable_speed / a;
+  temp.active_size_ratio = this->active_size_ratio / a;
+  temp.immutable_number = this->immutable_number / a;
+  temp.l0_num = this->l0_num / a;
+  temp.l0_drop_ratio = this->l0_drop_ratio / a;
+  temp.estimate_compaction_bytes = this->estimate_compaction_bytes / a;
+  temp.disk_bandwidth = this->disk_bandwidth / a;
+  temp.compaction_idle_time = this->compaction_idle_time / a;
+  temp.flush_idle_time = this->flush_idle_time / a;
+
+  temp.flush_speed_avg = this->flush_numbers == 0
+                             ? 0
+                             : this->flush_speed_avg / this->flush_numbers;
+  temp.flush_speed_var = this->flush_numbers == 0
+                             ? 0
+                             : this->flush_speed_var / this->flush_numbers;
+  temp.flush_gap_time =
+      this->flush_numbers == 0 ? 0 : this->flush_gap_time / this->flush_numbers;
+
+  return temp;
+}
+
+FEAT_Tuner::~FEAT_Tuner() = default;
+
+void FEAT_Tuner::DetectTuningOperations(int /*secs_elapsed*/,
+                                        std::vector<ChangePoint> *change_list) {
+  //   first, we tune only when the flushing speed is slower than before
+  auto current_score = this->ScoreTheSystem();
+  if (current_score.flush_speed_avg == 0) return ;
+  scores.push_back(current_score);
+  if (scores.size() == 1) {
+    return;
+  }
+  this->UpdateMaxScore(current_score);
+  if (scores.size() >= (size_t)this->score_array_len) {
+    // remove the first record
+    scores.pop_front();
+  }
+  CalculateAvgScore();
+
+  current_score_ = current_score;
+  
+//  std::cout << current_score_.flush_speed_avg<< std::endl;
+
+
+  //  std::cout << current_score_.memtable_speed << "/" <<
+  //  avg_scores.memtable_speed
+  //            << std::endl;
+
+   //<=avg_scores.memtable_speed * TEA_slow_flush) {
+
+  if (current_score_.flush_speed_avg >0 ){
+   TuningOP result{kKeep, kKeep};
+   if (TEA_enable) {
+      result = TuneByTEA();
+   }
+    if (FEA_enable) {
+      TuningOP fea_result = TuneByFEA();
+      result.BatchOp = fea_result.BatchOp;
+    }
+    FillUpChangeList(change_list, result);
+
+  }
+ }
+
+SystemScores FEAT_Tuner::normalize(SystemScores &origin_score) {
+  return origin_score;
+}
+
+TuningOP FEAT_Tuner::TuneByTEA() {
+  // the flushing speed is low.
+  TuningOP result{kKeep, kKeep};
+ 
+  if (current_score_.immutable_number >= 1){
+    result.ThreadOp = kLinearIncrease;
+  }
+
+  if (current_score_.flush_speed_avg < max_scores.flush_speed_avg * TEA_slow_flush && current_score_.flush_speed_avg > 0 ) {
+    result.ThreadOp = kHalf;
+    std::cout << "slow flush, decrease thread" << std::endl;
+  }
+
+
+  if (current_score_.estimate_compaction_bytes >= 1 || current_score_.l0_num >= 1) {
+    result.ThreadOp = kLinearIncrease;
+    std::cout << "lo/ro increase, thread" << std::endl;
+  }
+
+  return result;
+}
+
+TuningOP FEAT_Tuner::TuneByFEA() {
+  TuningOP negative_protocol{kKeep, kKeep};
+
+  if (current_score_.flush_speed_avg <
+          max_scores.flush_speed_avg * TEA_slow_flush ||
+      current_score_.immutable_number > 1) {
+    negative_protocol.BatchOp = kLinearIncrease;
+    std::cout << "slow flushing, increase batch" << std::endl;
+  }
+
+  if (current_score_.immutable_number == 0){
+     negative_protocol.BatchOp = kLinearIncrease;
+     std::cout << "no flushing, decrease batch" << std::endl;
+  
+  }
+
+  if (current_score_.estimate_compaction_bytes >= 1) {
+    negative_protocol.BatchOp = kHalf;
+    std::cout << "ro, decrease batch" << std::endl;
+  }
+  return negative_protocol;
+}
+void FEAT_Tuner::CalculateAvgScore() {
+  SystemScores result;
+  for (auto score : scores) {
+    result = result + score;
+  }
+  if (scores.size() > 0) result = result / scores.size();
+  this->avg_scores = result;
+}
+
+
 struct DBWithColumnFamilies {
   std::vector<ColumnFamilyHandle*> cfh;
   DB* db;
@@ -1633,19 +2418,29 @@ struct DBWithColumnFamilies {
   }
 };
 
-// a class that reports stats to CSV file
+
+typedef std::vector<double> LSM_STATE;
 class ReporterAgent {
+ private:
+  std::string header_string_;
+
  public:
+  static std::string Header() { return "secs_elapsed,interval_qps"; }
+
   ReporterAgent(Env* env, const std::string& fname,
-                uint64_t report_interval_secs)
-      : env_(env),
+                uint64_t report_interval_secs,
+                std::string header_string = Header())
+      : header_string_(header_string),
+        env_(env),
         total_ops_done_(0),
         last_report_(0),
         report_interval_secs_(report_interval_secs),
         stop_(false) {
     auto s = env_->NewWritableFile(fname, &report_file_, EnvOptions());
+
     if (s.ok()) {
-      s = report_file_->Append(Header() + "\n");
+      s = report_file_->Append(header_string_ + "\n");
+      //      std::cout << "opened report file" << std::endl;
     }
     if (s.ok()) {
       s = report_file_->Flush();
@@ -1655,29 +2450,33 @@ class ReporterAgent {
               s.ToString().c_str());
       abort();
     }
-
     reporting_thread_ = port::Thread([&]() { SleepAndReport(); });
   }
-
-  ~ReporterAgent() {
-    {
-      std::unique_lock<std::mutex> lk(mutex_);
-      stop_ = true;
-      stop_cv_.notify_all();
-    }
-    reporting_thread_.join();
-  }
+  virtual ~ReporterAgent();
 
   // thread safe
   void ReportFinishedOps(int64_t num_ops) {
     total_ops_done_.fetch_add(num_ops);
   }
 
- private:
-  std::string Header() const { return "secs_elapsed,interval_qps"; }
+  virtual void InsertNewTuningPoints(ChangePoint point);
+
+ protected:
+  virtual void DetectAndTuning(int secs_elapsed);
+  virtual Status ReportLine(int secs_elapsed, int total_ops_done_snapshot);
+  Env* env_;
+  std::unique_ptr<WritableFile> report_file_;
+  std::atomic<int64_t> total_ops_done_;
+  int64_t last_report_;
+  const uint64_t report_interval_secs_;
+  port::Thread reporting_thread_;
+  std::mutex mutex_;
+  // will notify on stop
+  std::condition_variable stop_cv_;
+  bool stop_;
+  uint64_t time_started;
   void SleepAndReport() {
-    uint64_t kMicrosInSecond = 1000 * 1000;
-    auto time_started = env_->NowMicros();
+    time_started = env_->NowMicros();
     while (true) {
       {
         std::unique_lock<std::mutex> lk(mutex_);
@@ -1691,16 +2490,17 @@ class ReporterAgent {
       }
       auto total_ops_done_snapshot = total_ops_done_.load();
       // round the seconds elapsed
+      //      auto secs_elapsed = env_->NowMicros();
       auto secs_elapsed =
           (env_->NowMicros() - time_started + kMicrosInSecond / 2) /
           kMicrosInSecond;
-      std::string report = ToString(secs_elapsed) + "," +
-                           ToString(total_ops_done_snapshot - last_report_) +
-                           "\n";
-      auto s = report_file_->Append(report);
+      DetectAndTuning(secs_elapsed);
+      auto s = this->ReportLine(secs_elapsed, total_ops_done_snapshot);
+      s = report_file_->Append("\n");
       if (s.ok()) {
         s = report_file_->Flush();
       }
+
       if (!s.ok()) {
         fprintf(stderr,
                 "Can't write to report file (%s), stopping the reporting\n",
@@ -1710,18 +2510,409 @@ class ReporterAgent {
       last_report_ = total_ops_done_snapshot;
     }
   }
-
-  Env* env_;
-  std::unique_ptr<WritableFile> report_file_;
-  std::atomic<int64_t> total_ops_done_;
-  int64_t last_report_;
-  const uint64_t report_interval_secs_;
-  rocksdb::port::Thread reporting_thread_;
-  std::mutex mutex_;
-  // will notify on stop
-  std::condition_variable stop_cv_;
-  bool stop_;
 };
+
+class ReporterAgentWithSILK : public ReporterAgent {
+ private:
+  bool pausedcompaction = false;
+  long prev_bandwidth_compaction_MBPS = 0;
+  int FLAGS_value_size = 1000;
+  int FLAGS_SILK_bandwidth_limitation = 350;
+  DBImpl* running_db_;
+
+ public:
+  ReporterAgentWithSILK(DBImpl* running_db, Env* env, const std::string& fname,
+                        uint64_t report_interval_secs, int32_t FLAGS_value_size,
+                        int32_t bandwidth_limitation);
+  Status ReportLine(int secs_elapsed, int total_ops_done_snapshot) override;
+};
+
+class ReporterAgentWithTuning : public ReporterAgent {
+ private:
+  std::vector<ChangePoint> tuning_points;
+  DBImpl* running_db_;
+  const Options options_when_boost;
+  uint64_t last_metrics_collect_secs;
+  uint64_t last_compaction_thread_len;
+  uint64_t last_flush_thread_len;
+  std::map<std::string, void*> string_to_attributes_map;
+  std::unique_ptr<DOTA_Tuner> tuner;
+  bool applying_changes;
+  static std::string DOTAHeader() {
+    return "secs_elapsed,interval_qps,batch_size,thread_num";
+  }
+  int tuning_gap_secs_;
+  std::map<std::string, std::string> parameter_map;
+  std::map<std::string, int> baseline_map;
+  const int thread_num_upper_bound = 12;
+  const int thread_num_lower_bound = 2;
+
+ public:
+  const static unsigned long history_lsm_shape =
+      10;  // Recorded history lsm shape, here we record 10 secs
+  std::deque<LSM_STATE> shape_list;
+  const size_t default_memtable_size = 64 << 20;
+  const float threashold = 0.5;
+  ReporterAgentWithTuning(DBImpl* running_db, Env* env,
+                          const std::string& fname,
+                          uint64_t report_interval_secs,
+                          uint64_t dota_tuning_gap_secs = 1);
+  DOTA_Tuner* GetTuner() { return tuner.get(); }
+  void ApplyChangePointsInstantly(std::vector<ChangePoint>* points);
+
+  void DetectChangesPoints(int sec_elapsed);
+
+  void PopChangePoints(int secs_elapsed);
+
+  static bool thread_idle_cmp(std::pair<size_t, uint64_t> p1,
+                              std::pair<size_t, uint64_t> p2) {
+    return p1.second < p2.second;
+  }
+
+  Status ReportLine(int secs_elapsed, int total_ops_done_snapshot) override;
+  void UseFEATTuner(bool TEA_enable, bool FEA_enable);
+  //  void print_useless_thing(int secs_elapsed);
+  void DetectAndTuning(int secs_elapsed) override;
+  enum CongestionStatus {
+    kCongestion,
+    kReachThreshold,
+    kUnderThreshold,
+    kIgnore
+  };
+
+  struct BatchSizeScore {
+    double l0_stall;
+    double memtable_stall;
+    double pending_bytes_stall;
+    double flushing_congestion;
+    double read_amp_score;
+    std::string ToString() {
+      std::stringstream ss;
+      ss << "l0 stall: " << l0_stall << " memtable stall: " << memtable_stall
+         << " pending bytes: " << pending_bytes_stall
+         << " flushing congestion: " << flushing_congestion
+         << " reading performance score: " << read_amp_score;
+      return ss.str();
+    }
+    std::string Differences() { return "batch size"; }
+  };
+  struct ThreadNumScore {
+    double l0_stall;
+    double memtable_stall;
+    double pending_bytes_stall;
+    double flushing_congestion;
+    double thread_idle;
+    std::string ToString() {
+      std::stringstream ss;
+      ss << "l0 stall: " << l0_stall << " memtable stall: " << memtable_stall
+         << " pending bytes: " << pending_bytes_stall
+         << " flushing congestion: " << flushing_congestion
+         << " thread_idle: " << thread_idle;
+      return ss.str();
+    }
+  };
+
+  TuningOP VoteForThread(ThreadNumScore& scores);
+  TuningOP VoteForMemtable(BatchSizeScore& scores);
+
+};  // end ReporterWithTuning
+typedef ReporterAgent DOTAAgent;
+class ReporterWithMoreDetails : public ReporterAgent {
+ private:
+  DBImpl* db_ptr;
+  std::string detailed_header() {
+    return ReporterAgent::Header() + ",immutables" + ",total_mem_size" +
+           ",l0_files" + ",all_sst_size" + ",live_data_size" + ",pending_bytes";
+  }
+
+ public:
+  ReporterWithMoreDetails(DBImpl* running_db, Env* env,
+                          const std::string& fname,
+                          uint64_t report_interval_secs)
+      : ReporterAgent(env, fname, report_interval_secs, detailed_header()) {
+    if (running_db == nullptr) {
+      std::cout << "Missing parameter db_ to record more details" << std::endl;
+      abort();
+
+    } else {
+      db_ptr = reinterpret_cast<DBImpl*>(running_db);
+    }
+  }
+
+  void DetectAndTuning(int secs_elapsed) override;
+
+  Status ReportLine(int secs_elapsed, int total_ops_done_snapshot) override {
+    auto opt = this->db_ptr->GetOptions();
+
+    //    current_opt = db_ptr->GetOptions();
+    auto version =
+        db_ptr->GetVersionSet()->GetColumnFamilySet()->GetDefault()->current();
+    auto cfd = version->cfd();
+    auto vfs = version->storage_info();
+    int l0_files = vfs->NumLevelFiles(0);
+    uint64_t total_mem_size = 0;
+    //    uint64_t active_mem = 0;
+    db_ptr->GetIntProperty("rocksdb.size-all-mem-tables", &total_mem_size);
+    //    db_ptr->GetIntProperty("rocksdb.cur-size-active-mem-table",
+    //    &active_mem);
+
+    uint64_t compaction_pending_bytes =
+        vfs->estimated_compaction_needed_bytes();
+    uint64_t live_data_size = vfs->EstimateLiveDataSize();
+    uint64_t all_sst_size = 0;
+    int immutable_memtables = cfd->imm()->NumNotFlushed();
+    for (int i = 0; i < vfs->num_levels(); i++) {
+      all_sst_size += vfs->NumLevelBytes(i);
+    }
+
+    std::string report =
+        std::to_string(secs_elapsed) + "," +
+        std::to_string(total_ops_done_snapshot - last_report_) + "," +
+        std::to_string(immutable_memtables) + "," + std::to_string(total_mem_size) + "," +
+        std::to_string(l0_files) + "," + std::to_string(all_sst_size) + "," +
+        std::to_string(live_data_size) + "," + std::to_string(compaction_pending_bytes);
+    //    std::cout << report << std::endl;
+    auto s = report_file_->Append(report);
+    return s;
+  }
+};
+
+ReporterAgent::~ReporterAgent() {
+  {
+    std::unique_lock<std::mutex> lk(mutex_);
+    stop_ = true;
+    stop_cv_.notify_all();
+  }
+  reporting_thread_.join();
+}
+void ReporterAgent::InsertNewTuningPoints(ChangePoint point) {
+  std::cout << "can't use change point @ " << point.change_timing
+            << " Due to using default reporter" << std::endl;
+};
+void ReporterAgent::DetectAndTuning(int /*secs_elapsed*/) {}
+Status ReporterAgent::ReportLine(int secs_elapsed,
+                                 int total_ops_done_snapshot) {
+  std::string report = std::to_string(secs_elapsed) + "," +
+                       std::to_string(total_ops_done_snapshot - last_report_);
+  auto s = report_file_->Append(report);
+  return s;
+}
+
+void ReporterAgentWithTuning::DetectChangesPoints(int sec_elapsed) {
+  std::vector<ChangePoint> change_points;
+  if (applying_changes) {
+    return;
+  }
+  tuner->DetectTuningOperations(sec_elapsed, &change_points);
+  ApplyChangePointsInstantly(&change_points);
+}
+
+void ReporterAgentWithTuning::DetectAndTuning(int secs_elapsed) {
+  if (secs_elapsed % tuning_gap_secs_ == 0) {
+    DetectChangesPoints(secs_elapsed);
+    //    this->running_db_->immutable_db_options().job_stats->clear();
+    last_metrics_collect_secs = secs_elapsed;
+  }
+  if (tuning_points.empty() ||
+      tuning_points.front().change_timing < secs_elapsed) {
+    return;
+  } else {
+    PopChangePoints(secs_elapsed);
+  }
+}
+
+Status ReporterAgentWithTuning::ReportLine(int secs_elapsed,
+                                           int total_ops_done_snapshot) {
+  auto opt = this->running_db_->GetOptions();
+
+  std::string report = std::to_string(secs_elapsed) + "," +
+                       std::to_string(total_ops_done_snapshot - last_report_) + "," +
+                       std::to_string(opt.write_buffer_size >> 20) + "," +
+                       std::to_string(opt.max_background_jobs);
+  auto s = report_file_->Append(report);
+  return s;
+}
+void ReporterAgentWithTuning::UseFEATTuner(bool TEA_enable, bool FEA_enable) {
+  tuner.release();
+  tuner.reset(new FEAT_Tuner(options_when_boost, running_db_, &last_report_,
+                             &total_ops_done_, env_, tuning_gap_secs_,
+                             TEA_enable, FEA_enable));
+};
+
+Status update_db_options(
+    DBImpl* running_db_,
+    std::unordered_map<std::string, std::string>* new_db_options,
+    bool* applying_changes, Env* /*env*/) {
+  *applying_changes = true;
+  Status s = running_db_->SetDBOptions(*new_db_options);
+  free(new_db_options);
+  *applying_changes = false;
+  return s;
+}
+
+Status update_cf_options(
+    DBImpl* running_db_,
+    std::unordered_map<std::string, std::string>* new_cf_options,
+    bool* applying_changes, Env* /*env*/) {
+  *applying_changes = true;
+  Status s = running_db_->SetOptions(*new_cf_options);
+  free(new_cf_options);
+  *applying_changes = false;
+  return s;
+}
+
+Status SILK_pause_compaction(DBImpl* running_db_, bool* stopped) {
+  Status s = running_db_->PauseBackgroundWork();
+  *stopped = true;
+  return s;
+}
+
+Status SILK_resume_compaction(DBImpl* running_db_, bool* stopped) {
+  Status s = running_db_->ContinueBackgroundWork();
+  *stopped = false;
+  return s;
+}
+
+void ReporterAgentWithTuning::ApplyChangePointsInstantly(
+    std::vector<ChangePoint>* points) {
+  std::unordered_map<std::string, std::string>* new_cf_options;
+  std::unordered_map<std::string, std::string>* new_db_options;
+
+  new_cf_options = new std::unordered_map<std::string, std::string>();
+  new_db_options = new std::unordered_map<std::string, std::string>();
+  if (points->empty()) {
+    return;
+  }
+
+  for (auto point : *points) {
+    if (point.db_width) {
+      new_db_options->emplace(point.opt, point.value);
+    } else {
+      new_cf_options->emplace(point.opt, point.value);
+    }
+  }
+  points->clear();
+  Status s;
+  if (!new_db_options->empty()) {
+    //    std::thread t();
+    std::thread t(update_db_options, running_db_, new_db_options,
+                  &applying_changes, env_);
+    t.detach();
+  }
+  if (!new_cf_options->empty()) {
+    std::thread t(update_cf_options, running_db_, new_cf_options,
+                  &applying_changes, env_);
+    t.detach();
+  }
+}
+
+ReporterAgentWithTuning::ReporterAgentWithTuning(DBImpl* running_db, Env* env,
+                                                 const std::string& fname,
+                                                 uint64_t report_interval_secs,
+                                                 uint64_t dota_tuning_gap_secs)
+    : ReporterAgent(env, fname, report_interval_secs, DOTAHeader()),
+      options_when_boost(running_db->GetOptions()) {
+  tuning_points = std::vector<ChangePoint>();
+  tuning_points.clear();
+  std::cout << "using reporter agent with change points." << std::endl;
+  if (running_db == nullptr) {
+    std::cout << "Missing parameter db_ to apply changes" << std::endl;
+    abort();
+  } else {
+    running_db_ = running_db;
+  }
+  this->tuning_gap_secs_ = std::max(dota_tuning_gap_secs, report_interval_secs);
+  this->last_metrics_collect_secs = 0;
+  this->last_compaction_thread_len = 0;
+  this->last_flush_thread_len = 0;
+  tuner.reset(new DOTA_Tuner(options_when_boost, running_db_, &last_report_,
+                             &total_ops_done_, env_, tuning_gap_secs_));
+  tuner->ResetTuner();
+  this->applying_changes = false;
+}
+
+inline double average(std::vector<double>& v) {
+  assert(!v.empty());
+  return accumulate(v.begin(), v.end(), 0.0) / v.size();
+}
+
+void ReporterAgentWithTuning::PopChangePoints(int secs_elapsed) {
+  std::vector<ChangePoint> valid_point;
+  for (auto it = tuning_points.begin(); it != tuning_points.end(); it++) {
+    if (it->change_timing <= secs_elapsed) {
+      if (running_db_ != nullptr) {
+        valid_point.push_back(*it);
+      }
+      tuning_points.erase(it--);
+    }
+  }
+  ApplyChangePointsInstantly(&valid_point);
+}
+
+void ReporterWithMoreDetails::DetectAndTuning(int secs_elapsed) {
+  //  report_file_->Append(",");
+  //  ReportLine(secs_elapsed, total_ops_done_);
+  secs_elapsed++;
+}
+
+Status ReporterAgentWithSILK::ReportLine(int secs_elapsed,
+                                         int total_ops_done_snapshot) {
+  // copy from SILK https://github.com/theoanab/SILK-USENIXATC2019
+  // //check the current bandwidth for user operations
+  long cur_throughput = (total_ops_done_snapshot - last_report_);
+  long cur_bandwidth_user_ops_MBPS =
+      cur_throughput * FLAGS_value_size / 1000000;
+
+  // SILK TESTING the Pause compaction work functionality
+  if (!pausedcompaction &&
+      cur_bandwidth_user_ops_MBPS > FLAGS_SILK_bandwidth_limitation * 0.75) {
+    // SILK Consider this a load peak
+    //    running_db_->PauseCompactionWork();
+    //    pausedcompaction = true;
+    pausedcompaction = true;
+    std::thread t(SILK_pause_compaction, running_db_, &pausedcompaction);
+    t.detach();
+
+  } else if (pausedcompaction && cur_bandwidth_user_ops_MBPS <=
+                                     FLAGS_SILK_bandwidth_limitation * 0.75) {
+    std::thread t(SILK_resume_compaction, running_db_, &pausedcompaction);
+    t.detach();
+  }
+
+  long cur_bandiwdth_compaction_MBPS =
+      FLAGS_SILK_bandwidth_limitation -
+      cur_bandwidth_user_ops_MBPS;  // measured 200MB/s SSD bandwidth on XEON.
+  if (cur_bandiwdth_compaction_MBPS < 10) {
+    cur_bandiwdth_compaction_MBPS = 10;
+  }
+  if (abs(prev_bandwidth_compaction_MBPS - cur_bandiwdth_compaction_MBPS) >=
+      10) {
+    auto opt = running_db_->GetOptions();
+    opt.rate_limiter.get()->SetBytesPerSecond(cur_bandiwdth_compaction_MBPS *
+                                              1000 * 1000);
+    prev_bandwidth_compaction_MBPS = cur_bandiwdth_compaction_MBPS;
+  }
+  // Adjust the tuner from SILK before reporting
+  std::string report = std::to_string(secs_elapsed) + "," +
+                       std::to_string(total_ops_done_snapshot - last_report_) + "," +
+                       std::to_string(cur_bandwidth_user_ops_MBPS);
+  auto s = report_file_->Append(report);
+  return s;
+}
+
+ReporterAgentWithSILK::ReporterAgentWithSILK(DBImpl* running_db, Env* env,
+                                             const std::string& fname,
+                                             uint64_t report_interval_secs,
+                                             int32_t value_size,
+                                             int32_t bandwidth_limitation)
+    : ReporterAgent(env, fname, report_interval_secs) {
+  std::cout << "SILK enabled, Disk bandwidth has been set to: "
+            << bandwidth_limitation << std::endl;
+  running_db_ = running_db;
+  this->FLAGS_value_size = value_size;
+  this->FLAGS_SILK_bandwidth_limitation = bandwidth_limitation;
+}
+
 
 enum OperationType : unsigned char {
   kRead = 0,
@@ -3211,12 +4402,42 @@ Stats RunBenchmark(int n, Slice name,
                     FLAGS_benchmark_read_rate_limit, 100000 /* refill_period_us */,
                     10 /* fairness */, RateLimiter::Mode::kReadsOnly));
     }
-
-    std::unique_ptr<ReporterAgent> reporter_agent;
+   
+        std::unique_ptr<ReporterAgent> reporter_agent;
     if (FLAGS_report_interval_seconds > 0) {
+      if ( FLAGS_DOTA_enable || FLAGS_TEA_enable ||
+          FLAGS_FEA_enable) {
+        // need to use another Report Agent
+        if (FLAGS_DOTA_tuning_gap == 0) {
+          reporter_agent.reset(new ReporterAgentWithTuning(
+              reinterpret_cast<DBImpl*>(db_.db), FLAGS_env, FLAGS_report_file,
+              FLAGS_report_interval_seconds, FLAGS_report_interval_seconds));
+        } else {
+          reporter_agent.reset(new ReporterAgentWithTuning(
+              reinterpret_cast<DBImpl*>(db_.db), FLAGS_env, FLAGS_report_file,
+              FLAGS_report_interval_seconds, FLAGS_DOTA_tuning_gap));
+        }
+        auto tuner_agent =
+            reinterpret_cast<ReporterAgentWithTuning*>(reporter_agent.get());
+        tuner_agent->UseFEATTuner(FLAGS_TEA_enable, FLAGS_FEA_enable);
+        tuner_agent->GetTuner()->set_idle_ratio(FLAGS_idle_rate);
+        tuner_agent->GetTuner()->set_gap_threshold(FLAGS_FEA_gap_threshold);
+        tuner_agent->GetTuner()->set_slow_flush_threshold(FLAGS_TEA_slow_flush);
+      } else if (FLAGS_detailed_running_stats) {
+        reporter_agent.reset(new ReporterWithMoreDetails(
+            reinterpret_cast<DBImpl*>(db_.db), FLAGS_env, FLAGS_report_file,
+            FLAGS_report_interval_seconds));
+      } else if (FLAGS_SILK_triggered) {
+        reporter_agent.reset(new ReporterAgentWithSILK(
+            reinterpret_cast<DBImpl*>(db_.db), FLAGS_env, FLAGS_report_file,
+            FLAGS_report_interval_seconds, FLAGS_value_size,
+            FLAGS_SILK_bandwidth_limitation));
+      } else {
         reporter_agent.reset(new ReporterAgent(FLAGS_env, FLAGS_report_file,
-                    FLAGS_report_interval_seconds));
+                                               FLAGS_report_interval_seconds));
+      }
     }
+
 
     ThreadArg* arg = new ThreadArg[n];
 

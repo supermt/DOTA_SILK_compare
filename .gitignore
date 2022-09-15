@@ -6,7 +6,7 @@ make_config.mk
 *.dylib*
 *.gcda
 *.gcno
-*.o
+**.o
 *.so
 *.so.*
 *_test
